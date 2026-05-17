@@ -1,0 +1,24 @@
+[project]
+name = "openearthmap-sar"
+version = "0.1.0"
+description = "The src code of this submodule comes from https://github.com/cliffbb/OpenEarthMap-SAR ."
+dependencies = [
+    "albumentations",
+    "opencv-python",
+    "matplotlib",
+    "numpy",
+    "pillow",
+    "rasterio",
+    "segmentation-models-pytorch",
+    "torch",
+    "torchvision",
+    "tqdm",
+]
+
+# Build settings should go at the bottom
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
