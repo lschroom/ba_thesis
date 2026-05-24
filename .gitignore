@@ -10,4 +10,13 @@ wheels/
 .venv
 
 # data
-data
+data/
+
+# helper scripts
+src/setup_check.py
+
+# notes
+notes/
+
+# external repositories
+external/

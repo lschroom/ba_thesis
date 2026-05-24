@@ -79,7 +79,7 @@ def disagreement_metrics(y_true, y_pred, num_classes):
     return total_quantity_disagreement, total_allocation_disagreement
 
 
-def calculate_metrics(y_true, y_pred, num_classes):
+def calculate_metrics(y_true, y_pred, num_classes=8):
     
     # mIoU (Macro Jaccard Score)
     miou = mIoU(y_pred, y_true, n_classes=num_classes+1)
@@ -121,9 +121,8 @@ def main(args):
 
     print("\n")
     print(f"Metrics for {results.upper()}:")
-    calculate_metrics(y_true, y_pred, num_classes=num_classes)
+    calculate_metrics(y_true, y_pred)
     print("\n")
-
 
 
 if __name__ == "__main__":

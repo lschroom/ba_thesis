@@ -33,8 +33,8 @@ def run_inference(result_root):
 
 
 def color_model_output(result_root):
-    colored_dir = DATA_ROOT / result_root / "colored"
-    overlay_dir = DATA_ROOT / result_root / "overlay"
+    colored_dir = result_root / "colored"
+    overlay_dir = result_root / "overlay"
     colored_dir.mkdir(parents=True, exist_ok=True)
     overlay_dir.mkdir(parents=True, exist_ok=True)
 
@@ -50,7 +50,7 @@ def color_model_output(result_root):
         Image.fromarray(rgb).save(out_colored_path)
         print(f"Saved colored output to: {str(out_colored_path.name)}")
 
-        sar_image_path = IMG_ROOT / f"{png_path.stem}.tif"
+        sar_image_path = pathlib.Path(IMG_ROOT / png_path.name).with_suffix('.tif')
         if not sar_image_path.exists():
             print(f"Warning: No matching SAR image found for {png_path.name}, expected {sar_image_path.name}")
             continue
