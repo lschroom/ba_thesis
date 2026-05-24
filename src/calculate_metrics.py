@@ -10,6 +10,7 @@ Usage: Choose a directory in data/oem_sar as --predictions to calculate and prin
 
 import argparse
 import numpy as np
+from scipy import ndimage
 from sklearn.metrics import confusion_matrix, classification_report, jaccard_score
 import pathlib
 import rasterio
@@ -49,6 +50,64 @@ def mIoU(y_pred, y_true, eps=1e-7, n_classes=9):
             iou_per_class.append(iou)
     return np.nanmean(iou_per_class)
 
+#--------------------------------------------------------------------
+def boundary_mask(mask, width=1):
+    """
+    Return a binary boundary map for a single-class mask.
+    width: how many pixels wide the boundary should be.
+    """
+    struct = np.ones((3, 3), dtype=bool)
+    eroded = ndimage.binary_erosion(mask, structure=struct, border_value=0)
+    boundary = mask & ~eroded
+    if width > 1:
+        dilate_struct = np.ones((2 * width + 1, 2 * width + 1), dtype=bool)
+        boundary = ndimage.binary_dilation(boundary, structure=dilate_struct)
+    return boundary
+
+
+def boundary_iou(y_true, y_pred, num_classes=9, boundary_width=1, ignore_background=True):
+    """
+    Compute dataset-level boundary IoU.
+    Accepts either:
+    - y_true, y_pred: (H, W) single image
+    - y_true, y_pred: (N, H, W) dataset
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    if y_true.shape != y_pred.shape:
+        raise ValueError("y_true and y_pred must have the same shape")
+
+    if y_true.ndim == 3:
+        image_scores = []
+        for true_mask, pred_mask in zip(y_true, y_pred):
+            image_scores.append(
+                boundary_iou(
+                    true_mask,
+                    pred_mask,
+                    num_classes=num_classes,
+                    boundary_width=boundary_width,
+                    ignore_background=ignore_background,
+                )
+            )
+        return np.nanmean(image_scores) if image_scores else 0.0
+
+    class_indices = range(1, num_classes) if ignore_background else range(num_classes)
+    ious = []
+
+    for cls in class_indices:
+        true_boundary = boundary_mask(y_true == cls, width=boundary_width)
+        pred_boundary = boundary_mask(y_pred == cls, width=boundary_width)
+
+        union = np.logical_or(true_boundary, pred_boundary).sum()
+        if union == 0:
+            continue
+
+        intersection = np.logical_and(true_boundary, pred_boundary).sum()
+        ious.append(intersection / union)
+
+    return np.nanmean(ious) if ious else 0.0
+#--------------------------------------------------------------------
 
 def disagreement_metrics(y_true, y_pred, num_classes):
     
@@ -94,6 +153,8 @@ def calculate_metrics(y_true, y_pred, num_classes=8):
     report = classification_report(y_true_flattened, y_pred_flattened, labels=range(num_classes), output_dict=True, zero_division=0)
     macro_recall = report['macro avg']['recall']
     mean_dice_macro_f1 = report['macro avg']['f1-score']
+    b_iou = boundary_iou(y_true, y_pred, num_classes=num_classes+1, boundary_width=1)
+
     
     # 2. Disagreement Metrics via Confusion Matrix Analysis
     total_quantity_disagreement, total_allocation_disagreement = disagreement_metrics(y_true_flattened, y_pred_flattened, num_classes)
@@ -104,7 +165,8 @@ def calculate_metrics(y_true, y_pred, num_classes=8):
     print(f"mIoU (Mean IoU):                {miou:.4f}")
     print(f"Macro Recall:                   {macro_recall:.4f}")
     print(f"Mean Dice / Macro F1:           {mean_dice_macro_f1:.4f}")
-    
+    print(f"Boundary IoU:                   {b_iou:.4f}")
+
     print(f"\n--- Disagreement Metrics ---")
     print(f"Quantity Disagreement (Q):      {total_quantity_disagreement:.4f}")
     print(f"Allocation Disagreement (A):    {total_allocation_disagreement:.4f}")
