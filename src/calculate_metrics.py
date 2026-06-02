@@ -9,12 +9,13 @@ Usage: Choose a directory in data/oem_sar as --predictions to calculate and prin
 """
 
 import argparse
+import json
+import pandas as pd
 import numpy as np
 from scipy import ndimage
 from sklearn.metrics import confusion_matrix, classification_report, jaccard_score
 import pathlib
 import rasterio
-import torch
 
 
 def load_labels(path):
@@ -22,35 +23,36 @@ def load_labels(path):
     return (src.read(1)).astype(np.uint8)
 
 
-# metrics
-
 def pixel_accuracy(y_true, y_pred):
-    return np.mean(y_true == y_pred)
+    return np.nanmean(y_true == y_pred)
+    
 
+def mIoU(y_pred, y_true, num_classes):
 
-def mIoU(y_pred, y_true, eps=1e-7, n_classes=9):
-
-    pr = torch.from_numpy(y_pred).to(torch.uint8)
-    gt = torch.from_numpy(y_true).to(torch.uint8)
-     
     iou_per_class = []
 
-    pr = pr.contiguous().view(-1)
-    gt = gt.contiguous().view(-1)
-
-    for sem_class in range(1, n_classes): # background is not included
-        pr_inds = (pr == sem_class)
-        gt_inds = (gt == sem_class)
-        if gt_inds.long().sum().item() == 0:
-            iou_per_class.append(np.nan)
-        else: 
-            intersect = torch.logical_and(pr_inds, gt_inds).sum().float().item()
-            union = torch.logical_or(pr_inds, gt_inds).sum().float().item()
-            iou = (intersect + eps) / (union + eps)
+    for i in range(1, num_classes): # background is not included
+        y_true_i = (y_true == i)
+        y_pred_i = (y_pred == i)
+        if np.sum(y_true_i) == 0:
+            continue
+        else:
+            iou = jaccard_score(y_true_i, y_pred_i, average='binary', zero_division=0)
             iou_per_class.append(iou)
+
     return np.nanmean(iou_per_class)
 
-#--------------------------------------------------------------------
+
+def classification_report_metrics(y_true, y_pred, num_classes):
+    report = classification_report(y_true, y_pred, labels=range(1, num_classes), output_dict=True, zero_division=0)
+
+    macro_recall = report['macro avg']['recall']
+    macro_precision = report['macro avg']['precision']
+    mean_dice_macro_f1 = report['macro avg']['f1-score']
+
+    return macro_precision, macro_recall, mean_dice_macro_f1
+
+
 def boundary_mask(mask, width=1):
     """
     Return a binary boundary map for a single-class mask.
@@ -64,19 +66,26 @@ def boundary_mask(mask, width=1):
         boundary = ndimage.binary_dilation(boundary, structure=dilate_struct)
     return boundary
 
-
-def boundary_iou(y_true, y_pred, num_classes=9, boundary_width=1, ignore_background=True):
+def boundary_iou(y_true, y_pred, num_classes, boundary_width=1):
     """
     Compute dataset-level boundary IoU.
     Accepts either:
     - y_true, y_pred: (H, W) single image
     - y_true, y_pred: (N, H, W) dataset
     """
-    y_true = np.asarray(y_true)
-    y_pred = np.asarray(y_pred)
 
-    if y_true.shape != y_pred.shape:
-        raise ValueError("y_true and y_pred must have the same shape")
+    if y_true.ndim == 1 and y_pred.ndim == 1 and y_true.size == y_pred.size:
+        # OpenEarthMap-SAR masks in this project are 1024x1024.
+        side = 1024
+        pixels_per_image = side * side
+        total_pixels = y_true.size
+        if total_pixels % pixels_per_image != 0:
+            raise ValueError(
+                "boundary_iou received flattened arrays with incompatible size for 1024x1024 masks."
+            )
+        n_images = total_pixels // pixels_per_image
+        y_true = y_true.reshape(n_images, side, side)
+        y_pred = y_pred.reshape(n_images, side, side)
 
     if y_true.ndim == 3:
         image_scores = []
@@ -86,18 +95,16 @@ def boundary_iou(y_true, y_pred, num_classes=9, boundary_width=1, ignore_backgro
                     true_mask,
                     pred_mask,
                     num_classes=num_classes,
-                    boundary_width=boundary_width,
-                    ignore_background=ignore_background,
+                    boundary_width=boundary_width
                 )
             )
         return np.nanmean(image_scores) if image_scores else 0.0
 
-    class_indices = range(1, num_classes) if ignore_background else range(num_classes)
     ious = []
 
-    for cls in class_indices:
-        true_boundary = boundary_mask(y_true == cls, width=boundary_width)
-        pred_boundary = boundary_mask(y_pred == cls, width=boundary_width)
+    for i in range(1, num_classes):
+        true_boundary = boundary_mask(y_true == i, width=boundary_width)
+        pred_boundary = boundary_mask(y_pred == i, width=boundary_width)
 
         union = np.logical_or(true_boundary, pred_boundary).sum()
         if union == 0:
@@ -106,18 +113,18 @@ def boundary_iou(y_true, y_pred, num_classes=9, boundary_width=1, ignore_backgro
         intersection = np.logical_and(true_boundary, pred_boundary).sum()
         ious.append(intersection / union)
 
-    return np.nanmean(ious) if ious else 0.0
-#--------------------------------------------------------------------
+    return np.nanmean(ious)
+
 
 def disagreement_metrics(y_true, y_pred, num_classes):
     
-    cm = confusion_matrix(y_true, y_pred, labels=range(num_classes))
+    cm = confusion_matrix(y_true, y_pred, labels=range(1, num_classes))
     cm_norm = cm / np.sum(cm)  # Entry p_ij is proportion of total population
-    
+
     quantity_disagreement = 0.0
     allocation_disagreement = 0.0
     
-    for g in range(num_classes):
+    for g in range(num_classes-1):  # Skip background class (0)
         # Marginal totals
         ref_total_g = np.sum(cm_norm[g, :])       # Row sum (Ground Truth total for class g)
         comp_total_g = np.sum(cm_norm[:, g])      # Col sum (Predicted total for class g)
@@ -138,58 +145,98 @@ def disagreement_metrics(y_true, y_pred, num_classes):
     return total_quantity_disagreement, total_allocation_disagreement
 
 
-def calculate_metrics(y_true, y_pred, num_classes=8):
-    
-    # mIoU (Macro Jaccard Score)
-    miou = mIoU(y_pred, y_true, n_classes=num_classes+1)
+def calculate_metrics(y_true, y_pred, num_classes):
 
+    metrics = {}
 
-    y_true_flattened = y_true.flatten()
-    y_pred_flattened = y_pred.flatten()
+    metrics.update({'Pixel Accuracy': pixel_accuracy(y_true, y_pred)})
 
-    p_accuracy = pixel_accuracy(y_true_flattened, y_pred_flattened)
-    
     # Classification Report gives us Macro F1 (Mean Dice) and Macro Recall
-    report = classification_report(y_true_flattened, y_pred_flattened, labels=range(num_classes), output_dict=True, zero_division=0)
-    macro_recall = report['macro avg']['recall']
-    mean_dice_macro_f1 = report['macro avg']['f1-score']
-    b_iou = boundary_iou(y_true, y_pred, num_classes=num_classes+1, boundary_width=1)
+    macro_precision, macro_recall, mean_dice_macro_f1 = classification_report_metrics(y_true, y_pred, num_classes=num_classes)
+    metrics.update({
+        'Macro Precision': macro_precision, 
+        'Macro Recall': macro_recall, 
+        'Mean Dice / Macro F1': mean_dice_macro_f1
+        }
+    )
 
-    
+    metrics.update({'mIoU': mIoU(y_pred, y_true, num_classes=num_classes)})
+    metrics.update({'Boundary IoU': boundary_iou(y_true, y_pred, num_classes=num_classes, boundary_width=1)})
+
     # 2. Disagreement Metrics via Confusion Matrix Analysis
-    total_quantity_disagreement, total_allocation_disagreement = disagreement_metrics(y_true_flattened, y_pred_flattened, num_classes)
-    
-    # Format and display output nicely
-    print(f"--- Core Vision Metrics ---")
-    print(f"Pixel Accuracy:                 {p_accuracy:.4f}")
-    print(f"mIoU (Mean IoU):                {miou:.4f}")
-    print(f"Macro Recall:                   {macro_recall:.4f}")
-    print(f"Mean Dice / Macro F1:           {mean_dice_macro_f1:.4f}")
-    print(f"Boundary IoU:                   {b_iou:.4f}")
+    total_quantity_disagreement, total_allocation_disagreement = disagreement_metrics(y_true, y_pred, num_classes=num_classes)
+    metrics.update({
+        'Quantity Disagreement': total_quantity_disagreement,
+        'Allocation Disagreement': total_allocation_disagreement
+    })
 
-    print(f"\n--- Disagreement Metrics ---")
-    print(f"Quantity Disagreement (Q):      {total_quantity_disagreement:.4f}")
-    print(f"Allocation Disagreement (A):    {total_allocation_disagreement:.4f}")
+    return metrics
+
+
+def load_metrics_file(path):
+    path = pathlib.Path(path)
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_metrics_file(path, metrics):
+    path = pathlib.Path(path)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+def normalize_metrics(metrics):
+    return {k: float(v) for k, v in metrics.items()}
+
+def evaluate_datasets(data_root, metrics_path, num_classes=9):
+    data_root = pathlib.Path(data_root)
+    metrics_path = pathlib.Path(metrics_path)
+
+    existing_metrics = load_metrics_file(metrics_path)
+    dataset_metrics = dict(existing_metrics)
+
+    y_pred = np.array([load_labels(path) for path in sorted((data_root / "results").glob("*.png"), key=lambda p: p.name)]).flatten()
+
+    # original dataset
+    if "Original" not in dataset_metrics:
+        y_true = np.array([load_labels(path) for path in sorted((data_root / "test/labels").glob("*.tif"), key=lambda p: p.name)]).flatten()
+        metrics = calculate_metrics(y_true, y_pred, num_classes=num_classes)
+        dataset_metrics["Original"] = normalize_metrics(metrics)
+        save_metrics_file(metrics_path, dataset_metrics)
+    else:
+        print("Original metrics already present in", metrics_path)
+
+    direct_subdirs = sorted([path for path in (data_root / "noise").iterdir() if path.is_dir()])
+    for noise_dir in direct_subdirs:
+        key = noise_dir.name
+        if key in dataset_metrics:
+            print(f"Skipping already-computed dataset: {key}")
+            continue
+
+        y_true = np.array([load_labels(path) for path in sorted(noise_dir.glob("*.png"), key=lambda p: p.name)]).flatten()
+
+        metrics = calculate_metrics(y_true, y_pred, num_classes=num_classes)
+        dataset_metrics[key] = normalize_metrics(metrics)
+        save_metrics_file(metrics_path, dataset_metrics)
+
+    return dataset_metrics
 
 
 
 def main(args):
-    DATA_ROOT = pathlib.Path.cwd().resolve().parent / "data/oem_sar"
-    results = args.predictions
-    num_classes = 8
-
-    y_true = np.array([load_labels(path) for path in (DATA_ROOT / "test/labels").glob("*.tif")])
-    y_pred = np.array([load_labels(path) for path in (DATA_ROOT / results).glob("*.png")])
-
-    print("\n")
-    print(f"Metrics for {results.upper()}:")
-    calculate_metrics(y_true, y_pred)
-    print("\n")
+    DATA_ROOT = pathlib.Path.cwd().resolve() / "data/oem_sar"
+    metrics_file = pathlib.Path(args.output_json)
+    eval_dict = evaluate_datasets(DATA_ROOT, metrics_file, num_classes=args.num_classes)
+    clean_dict = {pathlib.Path(k).name: v for k, v in eval_dict.items()}
+    df = pd.DataFrame.from_dict(clean_dict, orient='index')
+    print(df)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Metrics Calculation')
     parser.add_argument('--predictions', default="results", help='Predictions directory name under data root')
+    parser.add_argument('--num_classes', type=int, default=9, help='Number of classes')
+    parser.add_argument('--output-json', default="metrics.json", help='JSON file to read/update metrics incrementally')
 
     args = parser.parse_args()
     main(args)
