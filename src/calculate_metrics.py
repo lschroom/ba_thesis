@@ -1,9 +1,11 @@
 """
 Usage: Choose a directory in data/oem_sar as --predictions to calculate and print metrics, being:
     - Pixel Accuracy
-    - mIoU (Mean Intersection over Union)
-    - Macro F1 Score
-    - Macro Recall
+    - IoU per foreground class
+    - Precision per foreground class
+    - Recall per foreground class
+    - Dice / F1 per foreground class
+    - Boundary IoU per foreground class
     - Quantity Disagreement
     - Allocation Disagreement
 """
@@ -15,7 +17,19 @@ import numpy as np
 from scipy import ndimage
 from sklearn.metrics import confusion_matrix, classification_report, jaccard_score
 import pathlib
+import re
 import rasterio
+
+from experiment_log import DEFAULT_DB_PATH, log_metrics
+
+
+PER_CLASS_METRICS = {
+    "precision",
+    "recall",
+    "dice_f1",
+    "iou",
+    "boundary_iou",
+}
 
 
 def load_labels(path):
@@ -30,27 +44,41 @@ def pixel_accuracy(y_true, y_pred):
 def mIoU(y_pred, y_true, num_classes):
 
     iou_per_class = []
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
 
     for i in range(1, num_classes): # background is not included
         y_true_i = (y_true == i)
         y_pred_i = (y_pred == i)
         if np.sum(y_true_i) == 0:
-            continue
+            iou_per_class.append(np.nan)
         else:
             iou = jaccard_score(y_true_i, y_pred_i, average='binary', zero_division=0)
             iou_per_class.append(iou)
 
-    return np.nanmean(iou_per_class)
+    return np.asarray(iou_per_class, dtype=float)
 
 
 def classification_report_metrics(y_true, y_pred, num_classes):
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
     report = classification_report(y_true, y_pred, labels=range(1, num_classes), output_dict=True, zero_division=0)
 
-    macro_recall = report['macro avg']['recall']
-    macro_precision = report['macro avg']['precision']
-    mean_dice_macro_f1 = report['macro avg']['f1-score']
+    precision = []
+    recall = []
+    dice_f1 = []
 
-    return macro_precision, macro_recall, mean_dice_macro_f1
+    for i in range(1, num_classes):
+        class_metrics = report[str(i)]
+        precision.append(class_metrics['precision'])
+        recall.append(class_metrics['recall'])
+        dice_f1.append(class_metrics['f1-score'])
+
+    return (
+        np.asarray(precision, dtype=float),
+        np.asarray(recall, dtype=float),
+        np.asarray(dice_f1, dtype=float),
+    )
 
 
 def boundary_mask(mask, width=1):
@@ -98,7 +126,7 @@ def boundary_iou(y_true, y_pred, num_classes, boundary_width=1):
                     boundary_width=boundary_width
                 )
             )
-        return np.nanmean(image_scores) if image_scores else 0.0
+        return np.nanmean(image_scores, axis=0) if image_scores else np.full(num_classes - 1, np.nan)
 
     ious = []
 
@@ -108,16 +136,19 @@ def boundary_iou(y_true, y_pred, num_classes, boundary_width=1):
 
         union = np.logical_or(true_boundary, pred_boundary).sum()
         if union == 0:
+            ious.append(np.nan)
             continue
 
         intersection = np.logical_and(true_boundary, pred_boundary).sum()
         ious.append(intersection / union)
 
-    return np.nanmean(ious)
+    return np.asarray(ious, dtype=float)
 
 
 def disagreement_metrics(y_true, y_pred, num_classes):
     
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
     cm = confusion_matrix(y_true, y_pred, labels=range(1, num_classes))
     cm_norm = cm / np.sum(cm)  # Entry p_ij is proportion of total population
 
@@ -149,75 +180,90 @@ def calculate_metrics(y_true, y_pred, num_classes):
 
     metrics = {}
 
-    metrics.update({'Pixel Accuracy': pixel_accuracy(y_true, y_pred)})
+    metrics.update({'pixel_accuracy': pixel_accuracy(y_true, y_pred)})
 
-    # Classification Report gives us Macro F1 (Mean Dice) and Macro Recall
-    macro_precision, macro_recall, mean_dice_macro_f1 = classification_report_metrics(y_true, y_pred, num_classes=num_classes)
+    precision, recall, dice_f1 = classification_report_metrics(y_true, y_pred, num_classes=num_classes)
     metrics.update({
-        'Macro Precision': macro_precision, 
-        'Macro Recall': macro_recall, 
-        'Mean Dice / Macro F1': mean_dice_macro_f1
+        'precision': precision,
+        'recall': recall,
+        'dice_f1': dice_f1
         }
     )
 
-    metrics.update({'mIoU': mIoU(y_pred, y_true, num_classes=num_classes)})
-    metrics.update({'Boundary IoU': boundary_iou(y_true, y_pred, num_classes=num_classes, boundary_width=1)})
+    metrics.update({'iou': mIoU(y_pred, y_true, num_classes=num_classes)})
+    metrics.update({'boundary_iou': boundary_iou(y_true, y_pred, num_classes=num_classes, boundary_width=1)})
 
     # 2. Disagreement Metrics via Confusion Matrix Analysis
     total_quantity_disagreement, total_allocation_disagreement = disagreement_metrics(y_true, y_pred, num_classes=num_classes)
     metrics.update({
-        'Quantity Disagreement': total_quantity_disagreement,
-        'Allocation Disagreement': total_allocation_disagreement
+        'quantity_disagreement': total_quantity_disagreement,
+        'allocation_disagreement': total_allocation_disagreement
     })
 
     return metrics
 
 
-def load_metrics_file(path):
-    path = pathlib.Path(path)
-    if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def _finite_float(value):
+    value = float(value)
+    if not np.isfinite(value):
+        return None
+    return value
 
-def save_metrics_file(path, metrics):
-    path = pathlib.Path(path)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
 
-def normalize_metrics(metrics):
-    return {k: float(v) for k, v in metrics.items()}
+def _per_class_json(metric_name, values):
+    values = np.asarray(values, dtype=float)
+    return json.dumps(
+        {
+            f"{metric_name}_{class_id}": _finite_float(value)
+            for class_id, value in enumerate(values, start=1)
+        },
+        sort_keys=True,
+    )
 
-def evaluate_datasets(data_root, metrics_path, num_classes=9):
+
+def normalize_metrics_for_db(metrics):
+    normalized = {}
+    for key, value in metrics.items():
+        if key in PER_CLASS_METRICS:
+            normalized[key] = _per_class_json(key, value)
+        else:
+            normalized[key] = _finite_float(value)
+    return normalized
+
+
+def creation_tstamp_from_noise_dir(noise_dir):
+    match = re.search(r"_(\d{6}_\d{6})$", pathlib.Path(noise_dir).name)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def evaluate_datasets(data_root, db_path=None, predictions="results", num_classes=9):
     data_root = pathlib.Path(data_root)
-    metrics_path = pathlib.Path(metrics_path)
+    db_path = pathlib.Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    dataset_metrics = {}
 
-    existing_metrics = load_metrics_file(metrics_path)
-    dataset_metrics = dict(existing_metrics)
+    prediction_dir = data_root / predictions
+    y_pred = np.array([load_labels(path) for path in sorted(prediction_dir.glob("*.png"), key=lambda p: p.name)]).flatten()
 
-    y_pred = np.array([load_labels(path) for path in sorted((data_root / "results").glob("*.png"), key=lambda p: p.name)]).flatten()
-
-    # original dataset
-    if "Original" not in dataset_metrics:
-        y_true = np.array([load_labels(path) for path in sorted((data_root / "test/labels").glob("*.tif"), key=lambda p: p.name)]).flatten()
-        metrics = calculate_metrics(y_true, y_pred, num_classes=num_classes)
-        dataset_metrics["Original"] = normalize_metrics(metrics)
-        save_metrics_file(metrics_path, dataset_metrics)
-    else:
-        print("Original metrics already present in", metrics_path)
-
-    direct_subdirs = sorted([path for path in (data_root / "noise").iterdir() if path.is_dir()])
+    noise_root = data_root / "noise"
+    direct_subdirs = sorted([path for path in noise_root.iterdir() if path.is_dir()])
     for noise_dir in direct_subdirs:
-        key = noise_dir.name
-        if key in dataset_metrics:
-            print(f"Skipping already-computed dataset: {key}")
+        creation_tstamp = creation_tstamp_from_noise_dir(noise_dir)
+        if creation_tstamp is None:
+            print(f"Skipping noise directory without timestamp suffix: {noise_dir.name}")
             continue
 
         y_true = np.array([load_labels(path) for path in sorted(noise_dir.glob("*.png"), key=lambda p: p.name)]).flatten()
 
         metrics = calculate_metrics(y_true, y_pred, num_classes=num_classes)
-        dataset_metrics[key] = normalize_metrics(metrics)
-        save_metrics_file(metrics_path, dataset_metrics)
+        normalized_metrics = normalize_metrics_for_db(metrics)
+        log_metrics(
+            creation_tstamp,
+            normalized_metrics,
+            db_path=db_path,
+        )
+        dataset_metrics[noise_dir.name] = normalized_metrics
 
     return dataset_metrics
 
@@ -225,8 +271,12 @@ def evaluate_datasets(data_root, metrics_path, num_classes=9):
 
 def main(args):
     DATA_ROOT = pathlib.Path.cwd().resolve() / "data/oem_sar"
-    metrics_file = pathlib.Path(args.output_json)
-    eval_dict = evaluate_datasets(DATA_ROOT, metrics_file, num_classes=args.num_classes)
+    eval_dict = evaluate_datasets(
+        DATA_ROOT,
+        db_path=args.db_path,
+        predictions=args.predictions,
+        num_classes=args.num_classes,
+    )
     clean_dict = {pathlib.Path(k).name: v for k, v in eval_dict.items()}
     df = pd.DataFrame.from_dict(clean_dict, orient='index')
     print(df)
@@ -236,7 +286,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Metrics Calculation')
     parser.add_argument('--predictions', default="results", help='Predictions directory name under data root')
     parser.add_argument('--num_classes', type=int, default=9, help='Number of classes')
-    parser.add_argument('--output-json', default="metrics.json", help='JSON file to read/update metrics incrementally')
+    parser.add_argument('--db-path', default=DEFAULT_DB_PATH, help='SQLite DB file for experiment logs')
 
     args = parser.parse_args()
     main(args)

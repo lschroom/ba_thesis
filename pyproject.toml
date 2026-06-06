@@ -9,6 +9,7 @@ dependencies = [
     "lab>=8.9",
     "openearthmap-sar",
     "pandas>=3.0.3",
+    "pytest>=9.0.3",
     "scikit-image>=0.26.0",
     "scikit-learn>=1.8.0",
 ]
