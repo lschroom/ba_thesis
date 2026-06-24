@@ -14,13 +14,14 @@ import argparse
 import json
 import pandas as pd
 import numpy as np
-from scipy import ndimage
-from sklearn.metrics import confusion_matrix, classification_report, jaccard_score
 import pathlib
 import re
 import rasterio
+import sqlite3
 
-from experiment_log import DEFAULT_DB_PATH, log_metrics
+from scipy import ndimage
+from sklearn.metrics import confusion_matrix, classification_report
+from experiment_log import DEFAULT_DB_PATH, METRIC_COLUMNS, init_db, log_metric_updates
 
 
 PER_CLASS_METRICS = {
@@ -30,6 +31,15 @@ PER_CLASS_METRICS = {
     "iou",
     "boundary_iou",
 }
+CLASSIFICATION_METRICS = {
+    "precision",
+    "recall",
+    "dice_f1",
+}
+DISAGREEMENT_METRICS = {
+    "quantity_disagreement",
+    "allocation_disagreement",
+}
 
 
 def load_labels(path):
@@ -37,31 +47,43 @@ def load_labels(path):
     return (src.read(1)).astype(np.uint8)
 
 
+def ignore_gt_class(y_true, y_pred, ignore_class=0):
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    valid = y_true != ignore_class
+    return y_true[valid], y_pred[valid]
+
+
 def pixel_accuracy(y_true, y_pred):
+    y_true, y_pred = ignore_gt_class(y_true, y_pred)
+    if y_true.size == 0:
+        return np.nan
     return np.nanmean(y_true == y_pred)
     
 
 def mIoU(y_pred, y_true, num_classes):
 
     iou_per_class = []
-    y_true = np.asarray(y_true).ravel()
-    y_pred = np.asarray(y_pred).ravel()
+    y_true, y_pred = ignore_gt_class(y_true, y_pred)
 
     for i in range(1, num_classes): # background is not included
         y_true_i = (y_true == i)
         y_pred_i = (y_pred == i)
-        if np.sum(y_true_i) == 0:
+        union = np.logical_or(y_true_i, y_pred_i).sum()
+        if union == 0:
             iou_per_class.append(np.nan)
         else:
-            iou = jaccard_score(y_true_i, y_pred_i, average='binary', zero_division=0)
-            iou_per_class.append(iou)
+            intersection = np.logical_and(y_true_i, y_pred_i).sum()
+            iou_per_class.append(intersection / union)
 
     return np.asarray(iou_per_class, dtype=float)
 
 
 def classification_report_metrics(y_true, y_pred, num_classes):
-    y_true = np.asarray(y_true).ravel()
-    y_pred = np.asarray(y_pred).ravel()
+    y_true, y_pred = ignore_gt_class(y_true, y_pred)
+    if y_true.size == 0:
+        empty_scores = np.full(num_classes - 1, np.nan)
+        return empty_scores, empty_scores.copy(), empty_scores.copy()
     report = classification_report(y_true, y_pred, labels=range(1, num_classes), output_dict=True, zero_division=0)
 
     precision = []
@@ -89,9 +111,6 @@ def boundary_mask(mask, width=1):
     struct = np.ones((3, 3), dtype=bool)
     eroded = ndimage.binary_erosion(mask, structure=struct, border_value=0)
     boundary = mask & ~eroded
-    if width > 1:
-        dilate_struct = np.ones((2 * width + 1, 2 * width + 1), dtype=bool)
-        boundary = ndimage.binary_dilation(boundary, structure=dilate_struct)
     return boundary
 
 def boundary_iou(y_true, y_pred, num_classes, boundary_width=1):
@@ -101,6 +120,9 @@ def boundary_iou(y_true, y_pred, num_classes, boundary_width=1):
     - y_true, y_pred: (H, W) single image
     - y_true, y_pred: (N, H, W) dataset
     """
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
 
     if y_true.ndim == 1 and y_pred.ndim == 1 and y_true.size == y_pred.size:
         # OpenEarthMap-SAR masks in this project are 1024x1024.
@@ -129,6 +151,7 @@ def boundary_iou(y_true, y_pred, num_classes, boundary_width=1):
         return np.nanmean(image_scores, axis=0) if image_scores else np.full(num_classes - 1, np.nan)
 
     ious = []
+    y_pred = np.where(y_true == 0, 0, y_pred)
 
     for i in range(1, num_classes):
         true_boundary = boundary_mask(y_true == i, width=boundary_width)
@@ -147,15 +170,19 @@ def boundary_iou(y_true, y_pred, num_classes, boundary_width=1):
 
 def disagreement_metrics(y_true, y_pred, num_classes):
     
-    y_true = np.asarray(y_true).ravel()
-    y_pred = np.asarray(y_pred).ravel()
-    cm = confusion_matrix(y_true, y_pred, labels=range(1, num_classes))
-    cm_norm = cm / np.sum(cm)  # Entry p_ij is proportion of total population
+    y_true, y_pred = ignore_gt_class(y_true, y_pred)
+    if y_true.size == 0:
+        return np.nan, np.nan
+    cm = confusion_matrix(y_true, y_pred, labels=range(num_classes))
+    total = np.sum(cm)
+    if total == 0:
+        return np.nan, np.nan
+    cm_norm = cm / total  # Entry p_ij is proportion of total population
 
     quantity_disagreement = 0.0
     allocation_disagreement = 0.0
     
-    for g in range(num_classes-1):  # Skip background class (0)
+    for g in range(num_classes):
         # Marginal totals
         ref_total_g = np.sum(cm_norm[g, :])       # Row sum (Ground Truth total for class g)
         comp_total_g = np.sum(cm_norm[:, g])      # Col sum (Predicted total for class g)
@@ -231,6 +258,88 @@ def normalize_metrics_for_db(metrics):
     return normalized
 
 
+def metric_status_by_tstamp(db_path):
+    init_db(db_path)
+    db_path = pathlib.Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    selected_columns = ", ".join(("creation_tstamp", *METRIC_COLUMNS))
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT {selected_columns}
+            FROM experiment_logs
+            """
+        ).fetchall()
+
+    status = {}
+    for row in rows:
+        creation_tstamp = row[0]
+        status[creation_tstamp] = {
+            metric_name
+            for metric_name, value in zip(METRIC_COLUMNS, row[1:])
+            if value is not None
+        }
+    return status
+
+
+def calculate_missing_metrics(y_true, y_pred, num_classes, missing_metrics):
+    missing_metrics = set(missing_metrics)
+    metrics = {}
+
+    if "pixel_accuracy" in missing_metrics:
+        metrics["pixel_accuracy"] = pixel_accuracy(y_true, y_pred)
+
+    classification_missing = CLASSIFICATION_METRICS & missing_metrics
+    if classification_missing:
+        precision, recall, dice_f1 = classification_report_metrics(
+            y_true,
+            y_pred,
+            num_classes=num_classes,
+        )
+        classification_values = {
+            "precision": precision,
+            "recall": recall,
+            "dice_f1": dice_f1,
+        }
+        metrics.update(
+            {
+                metric_name: classification_values[metric_name]
+                for metric_name in classification_missing
+            }
+        )
+
+    if "iou" in missing_metrics:
+        metrics["iou"] = mIoU(y_pred, y_true, num_classes=num_classes)
+
+    if "boundary_iou" in missing_metrics:
+        metrics["boundary_iou"] = boundary_iou(
+            y_true,
+            y_pred,
+            num_classes=num_classes,
+            boundary_width=1,
+        )
+
+    disagreement_missing = DISAGREEMENT_METRICS & missing_metrics
+    if disagreement_missing:
+        quantity_disagreement, allocation_disagreement = disagreement_metrics(
+            y_true,
+            y_pred,
+            num_classes=num_classes,
+        )
+        disagreement_values = {
+            "quantity_disagreement": quantity_disagreement,
+            "allocation_disagreement": allocation_disagreement,
+        }
+        metrics.update(
+            {
+                metric_name: disagreement_values[metric_name]
+                for metric_name in disagreement_missing
+            }
+        )
+
+    return metrics
+
+
 def creation_tstamp_from_noise_dir(noise_dir):
     match = re.search(r"_(\d{6}_\d{6})$", pathlib.Path(noise_dir).name)
     if match is None:
@@ -242,6 +351,8 @@ def evaluate_datasets(data_root, db_path=None, predictions="results", num_classe
     data_root = pathlib.Path(data_root)
     db_path = pathlib.Path(db_path) if db_path is not None else DEFAULT_DB_PATH
     dataset_metrics = {}
+    metric_status = metric_status_by_tstamp(db_path)
+    all_metrics = set(METRIC_COLUMNS)
 
     prediction_dir = data_root / predictions
     y_pred = np.array([load_labels(path) for path in sorted(prediction_dir.glob("*.png"), key=lambda p: p.name)]).flatten()
@@ -249,21 +360,35 @@ def evaluate_datasets(data_root, db_path=None, predictions="results", num_classe
     noise_root = data_root / "noise"
     direct_subdirs = sorted([path for path in noise_root.iterdir() if path.is_dir()])
     for noise_dir in direct_subdirs:
-        creation_tstamp = creation_tstamp_from_noise_dir(noise_dir)
-        if creation_tstamp is None:
-            print(f"Skipping noise directory without timestamp suffix: {noise_dir.name}")
-            continue
+        noisy_set_dirs = sorted([path for path in noise_dir.iterdir() if path.is_dir()])
+        for noisy_set in noisy_set_dirs:
+            creation_tstamp = creation_tstamp_from_noise_dir(noisy_set)
+            if creation_tstamp is None:
+                print(f"Skipping noise directory without timestamp suffix: {noisy_set.name}")
+                continue
 
-        y_true = np.array([load_labels(path) for path in sorted(noise_dir.glob("*.png"), key=lambda p: p.name)]).flatten()
+            existing_metrics = metric_status.get(creation_tstamp, set())
+            missing_metrics = all_metrics - existing_metrics
+            if not missing_metrics:
+                print(f"Skipping dataset with complete metrics: {noisy_set.name}")
+                continue
 
-        metrics = calculate_metrics(y_true, y_pred, num_classes=num_classes)
-        normalized_metrics = normalize_metrics_for_db(metrics)
-        log_metrics(
-            creation_tstamp,
-            normalized_metrics,
-            db_path=db_path,
-        )
-        dataset_metrics[noise_dir.name] = normalized_metrics
+            y_true = np.array([load_labels(path) for path in sorted(noisy_set.glob("*.png"), key=lambda p: p.name)]).flatten()
+    
+            metrics = calculate_missing_metrics(
+                y_true,
+                y_pred,
+                num_classes=num_classes,
+                missing_metrics=missing_metrics,
+            )
+            normalized_metrics = normalize_metrics_for_db(metrics)
+            log_metric_updates(
+                creation_tstamp,
+                normalized_metrics,
+                db_path=db_path,
+            )
+            metric_status[creation_tstamp] = existing_metrics | set(normalized_metrics)
+            dataset_metrics[noisy_set.name] = normalized_metrics
 
     return dataset_metrics
 

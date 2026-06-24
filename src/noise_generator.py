@@ -1,17 +1,20 @@
 import pathlib
-from datetime import datetime
-
 import cv2
+import random
 import numpy as np
 import scipy.ndimage as ndimage
 import sklearn as sk
+from datetime import datetime
 from PIL import Image
-
 from experiment_log import log_generation
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATA_ROOT = REPO_ROOT / "data" / "oem_sar"
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
 
 
 def load_labels(path):
@@ -37,12 +40,14 @@ def generated_directory_name(noise_method, timestamp=None):
 def creation_tstamp(timestamp=None):
     if timestamp is None:
         timestamp = datetime.now()
+    if timestamp is None:
+        timestamp = datetime.now()
     if isinstance(timestamp, str):
         return timestamp
     return timestamp.strftime("%y%m%d_%H%M%S")
 
 
-def add_random_pixel_noise(y_true, n_classes, noise_rate=0.05, class_ids=None):
+def add_random_pixel_noise(y_true, n_classes, noise_rate, class_ids=None):
     """
     Add random label noise at pixel level.
 
@@ -78,7 +83,7 @@ def add_random_pixel_noise(y_true, n_classes, noise_rate=0.05, class_ids=None):
     return noisy
 
 
-def boundary_dilation_erosion(y_true, class_ids, std=2.0, fallback_class=0):
+def boundary_dilation_erosion(y_true, class_ids, std, fallback_class=0):
     """
     Randomly dilate or erode connected objects of selected classes.
 
@@ -164,11 +169,31 @@ def boundary_dilation_erosion(y_true, class_ids, std=2.0, fallback_class=0):
     return noisy
 
 
-def add_semantic_swapping(y_true, y_pred, n_classes):
+def add_semantic_swapping(y_true, y_pred, n_classes, swap_prob, class_ids=None):
     """
-    Replace connected components using class-confusion probabilities derived
-    from predictions against the labels.
+    Replace foreground connected components using class-confusion probabilities.
+
+    ``swap_prob`` controls whether an eligible object changes class. When an
+    object is selected, the replacement is sampled from the source class's
+    confusion row with the source class excluded.
     """
+    if not 0.0 <= swap_prob <= 1.0:
+        raise ValueError("'swap_prob' must be between 0 and 1.")
+
+    if class_ids is None:
+        class_ids = np.arange(1, n_classes)
+    if isinstance(class_ids, (int, np.integer)):
+        class_ids = [int(class_ids)]
+    class_ids = [int(class_id) for class_id in class_ids]
+    invalid_class_ids = [
+        class_id for class_id in class_ids if class_id < 0 or class_id >= n_classes
+    ]
+    if invalid_class_ids:
+        raise ValueError(
+            f"'class_ids' must be between 0 and {n_classes - 1}; "
+            f"got {invalid_class_ids}."
+        )
+
     structure = np.ones((3, 3), dtype=np.int32)
     class_choices = np.arange(n_classes)
     confusion_mat = sk.metrics.confusion_matrix(
@@ -181,6 +206,15 @@ def add_semantic_swapping(y_true, y_pred, n_classes):
         out=np.eye(n_classes, dtype=float),
         where=row_sums != 0,
     )
+    replacement_probs_by_class = {}
+    for class_id in class_ids:
+        replacement_probs = relative_confusion_matrix[class_id].copy()
+        replacement_probs[class_id] = 0.0
+        replacement_sum = replacement_probs.sum()
+        if replacement_sum == 0.0:
+            replacement_probs_by_class[class_id] = None
+        else:
+            replacement_probs_by_class[class_id] = replacement_probs / replacement_sum
 
     noisy_set = np.empty_like(y_true)
 
@@ -192,32 +226,44 @@ def add_semantic_swapping(y_true, y_pred, n_classes):
         ).nonzero()[0]
 
         for class_id in present_classes:
+            if class_id not in replacement_probs_by_class:
+                continue
+
+            replacement_probs = replacement_probs_by_class[class_id]
+            if replacement_probs is None:
+                continue
+
             class_mask = mask == class_id
             labeled, n_objects = ndimage.label(class_mask, structure=structure)
             if n_objects == 0:
                 continue
 
+            swap_objects = np.random.rand(n_objects) < swap_prob
+            if not swap_objects.any():
+                continue
+
             replacement_classes = np.random.choice(
                 class_choices,
-                size=n_objects,
-                p=relative_confusion_matrix[class_id],
+                size=int(swap_objects.sum()),
+                p=replacement_probs,
             )
+            replacement_idx = 0
 
             for obj_id, object_slice in enumerate(ndimage.find_objects(labeled), start=1):
-                if object_slice is None:
+                if object_slice is None or not swap_objects[obj_id - 1]:
                     continue
 
-                new_class = replacement_classes[obj_id - 1]
-                if new_class != class_id:
-                    object_mask = labeled[object_slice] == obj_id
-                    noisy_mask[object_slice][object_mask] = new_class
+                new_class = replacement_classes[replacement_idx]
+                replacement_idx += 1
+                object_mask = labeled[object_slice] == obj_id
+                noisy_mask[object_slice][object_mask] = new_class
 
         noisy_set[i] = noisy_mask
 
     return noisy_set
 
 
-def shift_objects(y_true, class_ids, std=5.0, shift_prob=1.0):
+def shift_objects(y_true, class_ids, std, shift_prob=1.0):
     """
     Shift connected components using bbox-local masks.
     """
@@ -327,7 +373,7 @@ def shift_objects(y_true, class_ids, std=5.0, shift_prob=1.0):
     return noisy_set
 
 
-def noisy_zoom(y_true, std=0.05, fill_class=0):
+def noisy_zoom(y_true, std, fill_class=0):
     """
     Zoom each label mask with a normally distributed scale.
     """
@@ -360,7 +406,7 @@ def noisy_zoom(y_true, std=0.05, fill_class=0):
     return output
 
 
-def shift_scene(y_true, std=1.0):
+def shift_scene(y_true, std):
     """
     Shift the full label mask and mirror-fill newly exposed border pixels.
     """
@@ -385,14 +431,18 @@ def shift_scene(y_true, std=1.0):
 def omission_noise(
     y_true,
     class_ids=None,
-    base_prob=0.5,
-    size_decay=200.0,
-    min_prob=0.01,
+    omission_prob=0.25,
+    small_object_threshold=None,
     fallback_class=0,
 ):
     """
-    Simulate human annotation omission errors for selected object classes.
+    Simulate human annotation omission errors for selected small objects.
     """
+    if small_object_threshold is None:
+        raise ValueError("omission_noise requires a 'small_object_threshold'.")
+    if not 0.0 <= omission_prob <= 1.0:
+        raise ValueError("'omission_prob' must be between 0 and 1.")
+
     if class_ids is None:
         class_ids = np.arange(9)[1:]
     if isinstance(class_ids, (int, np.integer)):
@@ -414,10 +464,10 @@ def omission_noise(
                 obj_mask = labeled == obj_id
                 obj_size = obj_mask.sum()
 
-                prob = base_prob * np.exp(-obj_size / float(size_decay))
-                prob = max(prob, min_prob)
+                if obj_size > small_object_threshold:
+                    continue
 
-                if np.random.rand() < prob:
+                if np.random.rand() < omission_prob:
                     neighbor_region = (
                         ndimage.binary_dilation(obj_mask, structure=structure) & ~obj_mask
                     )
@@ -438,42 +488,44 @@ def omission_noise(
     return noisy
 
 
+def small_object_threshold_percentile(y_true, class_ids=None, percentile=90):
+    """
+    Return a connected-component size percentile for selected classes.
+    """
+    if class_ids is None:
+        class_ids = np.arange(9)[1:]
+    if isinstance(class_ids, (int, np.integer)):
+        class_ids = [int(class_ids)]
+    class_ids = [int(class_id) for class_id in class_ids]
+
+    structure = np.ones((3, 3), dtype=np.int32)
+    object_sizes = []
+
+    for mask in np.asarray(y_true):
+        for class_id in class_ids:
+            labeled, n_objects = ndimage.label(mask == class_id, structure=structure)
+            if n_objects == 0:
+                continue
+            object_sizes.extend(np.bincount(labeled.ravel())[1:])
+
+    if not object_sizes:
+        raise ValueError(
+            "Cannot compute small object threshold: no connected objects found "
+            f"for class_ids={class_ids}."
+        )
+
+    return float(np.percentile(np.asarray(object_sizes, dtype=np.int64), percentile))
+
+
 def noise_methods(n_classes):
     return {
-        "swap_classes": (
-            add_semantic_swapping,
-            {"n_classes": n_classes},
-        ),
-        "zoom": (
-            noisy_zoom,
-            {"std": 0.10, "fill_class": 0},
-        ),
-        "shift_scene": (
-            shift_scene,
-            {"std": 7.0},
-        ),
-        "shift_objects": (
-            shift_objects,
-            {"std": 7.0, "class_ids": [5, 8]},
-        ),
-        "add_omission": (
-            omission_noise,
-            {
-                "class_ids": list(range(1, 9)),
-                "base_prob": 0.5,
-                "size_decay": 200.0,
-                "min_prob": 0.01,
-                "fallback_class": 0,
-            },
-        ),
-        "random_pixels": (
-            add_random_pixel_noise,
-            {"n_classes": n_classes, "noise_rate": 0.05},
-        ),
-        "boundary_morphology": (
-            boundary_dilation_erosion,
-            {"class_ids": [4, 5, 8], "std": 2.0, "fallback_class": 0},
-        ),
+        "swap_classes": add_semantic_swapping,
+        "zoom": noisy_zoom,
+        "shift_scene": shift_scene,
+        "shift_objects": shift_objects,
+        "add_omission": omission_noise,
+        "random_pixels": add_random_pixel_noise,
+        "boundary_morphology": boundary_dilation_erosion,
     }
 
 
@@ -486,44 +538,68 @@ def _save_generated_masks(output, output_dir, source_files):
         Image.fromarray(img.astype(np.uint8)).save(output_dir / f"{source_path.stem}.png")
 
 
-def add_noise(pr_path, n_classes, noise_method, *, data_root=None, db_path=None, timestamp=None):
+def add_noise(
+    pr_path,
+    n_classes,
+    noise_specs,
+    *,
+    data_root=None,
+    db_path=None,
+):
     data_root = pathlib.Path(data_root) if data_root is not None else DATA_ROOT
     pr_path = pathlib.Path(pr_path)
     if not pr_path.is_absolute():
         pr_path = data_root / pr_path
 
     methods = noise_methods(n_classes)
-    if noise_method not in methods:
+    unknown_methods = set(noise_specs) - set(methods)
+    if unknown_methods:
         known_methods = ", ".join(sorted(methods))
-        raise ValueError(f"Unknown noise method: {noise_method}. Expected one of: {known_methods}")
-
-    timestamp_text = creation_tstamp(timestamp)
-    dataset_id = generated_directory_name(noise_method, timestamp=timestamp_text)
-    output_dir = data_root / "noise" / dataset_id
-    if output_dir.exists():
-        raise FileExistsError(f"Noise output directory already exists: {output_dir}")
+        unknown_text = ", ".join(sorted(unknown_methods))
+        raise ValueError(f"Unknown noise method: {unknown_text}. Expected one of: {known_methods}")
 
     gt_files = sorted((data_root / "test" / "labels").glob("*.tif"), key=lambda p: p.name)
-    if not gt_files:
-        raise FileNotFoundError(f"No label files found in {data_root / 'test' / 'labels'}")
-
     y_true = _load_sorted_masks(gt_files)
+    created_dirs = []
 
-    generator, gen_params = methods[noise_method]
-    if noise_method == "swap_classes":
-        pr_files = sorted(pr_path.glob("*.png"), key=lambda p: p.name)
-        if len(pr_files) != len(gt_files):
-            raise ValueError(
-                f"swap_classes requires {len(gt_files)} predictions, found {len(pr_files)} in {pr_path}"
+    for noise_method, noise_spec in noise_specs.items():
+        generator = methods[noise_method]
+        count = noise_spec.get("count", 0)
+        base_params = dict(noise_spec.get("params", {}))
+
+        for _ in range(count):
+            gen_params = dict(base_params)
+            if noise_method == "add_omission" and "small_object_threshold" not in gen_params:
+                gen_params["small_object_threshold"] = small_object_threshold_percentile(
+                    y_true,
+                    class_ids=gen_params.get("class_ids"),
+                    percentile=90,
+                )
+
+            timestamp_text = creation_tstamp()
+            dataset_id = generated_directory_name(noise_method, timestamp=timestamp_text)
+            output_dir = data_root / "noise" / noise_method / dataset_id
+
+            if noise_method == "swap_classes":
+                pr_files = sorted(pr_path.glob("*.png"), key=lambda p: p.name)
+                if len(pr_files) != len(gt_files):
+                    raise ValueError(
+                        f"swap_classes requires {len(gt_files)} predictions, found {len(pr_files)} in {pr_path}"
+                    )
+                y_pred = _load_sorted_masks(pr_files)
+                output = generator(y_true, y_pred, **gen_params)
+            else:
+                output = generator(y_true, **gen_params)
+
+            output_dir.mkdir(parents=True)
+            _save_generated_masks(output, output_dir, gt_files)
+            # color_model_output(result_root=output_dir)
+            log_generation(
+                timestamp_text,
+                generator.__name__,
+                gen_params,
+                db_path=db_path,
             )
-        y_pred = _load_sorted_masks(pr_files)
-        output = generator(y_true, y_pred, **gen_params)
-    else:
-        output = generator(y_true, **gen_params)
+            created_dirs.append(output_dir)
 
-    output_dir.mkdir(parents=True)
-    _save_generated_masks(output, output_dir, gt_files)
-    color_model_output(result_root=output_dir)
-    log_generation(timestamp_text, generator.__name__, gen_params, db_path=db_path)
-
-    return output_dir
+    return created_dirs
