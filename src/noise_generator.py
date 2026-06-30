@@ -382,7 +382,7 @@ def noisy_zoom(y_true, std, fill_class=0):
     output = np.empty_like(y_true)
     h, w = y_true.shape[1], y_true.shape[2]
     center = (w / 2.0, h / 2.0)
-    scales = np.maximum(np.random.normal(loc=1.0, scale=std, size=len(y_true)), 1e-6)
+    scales = np.maximum(np.random.normal(loc=1.0, scale=std, size=len(y_true)), 0.4)
 
     for i, (mask, scale) in enumerate(zip(y_true, scales)):
         matrix = cv2.getRotationMatrix2D(center, 0.0, scale)
@@ -390,7 +390,7 @@ def noisy_zoom(y_true, std, fill_class=0):
         if scale >= 1.0:
             border_mode = cv2.BORDER_CONSTANT
             border_value = fill_class
-        else:
+        else:   
             border_mode = cv2.BORDER_REFLECT_101
             border_value = 0
 

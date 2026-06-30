@@ -23,6 +23,16 @@ DATA_PARAM_NAMES = {
     "output_dir",
     "result_root",
 }
+METRIC_COLUMNS = (
+    "pixel_accuracy",
+    "precision",
+    "recall",
+    "dice_f1",
+    "iou",
+    "boundary_iou",
+    "quantity_disagreement",
+    "allocation_disagreement",
+)
 
 
 def init_db(db_path=None):
@@ -150,6 +160,35 @@ def log_metrics(creation_tstamp, metrics, db_path=None):
             raise ValueError(
                 f"No experiment log row exists for creation_tstamp '{creation_tstamp}'."
             )
+
+
+def log_metric_updates(creation_tstamp, metrics, db_path=None):
+    init_db(db_path)
+    db_path = pathlib.Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    invalid_metrics = set(metrics) - set(METRIC_COLUMNS)
+    if invalid_metrics:
+        raise ValueError(f"Unknown metric columns: {sorted(invalid_metrics)}")
+    if not metrics:
+        return
+
+    columns = [column for column in METRIC_COLUMNS if column in metrics]
+    insert_columns = ["creation_tstamp", *columns]
+    placeholders = ", ".join(["?"] * len(insert_columns))
+    update_clause = ", ".join(
+        f"{column} = excluded.{column}"
+        for column in columns
+    )
+    values = [creation_tstamp, *[metrics[column] for column in columns]]
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            f"""
+            INSERT INTO experiment_logs ({", ".join(insert_columns)})
+            VALUES ({placeholders})
+            ON CONFLICT(creation_tstamp) DO UPDATE SET {update_clause}
+            """,
+            values,
+        )
 
 
 def log_noise_generation(func):
