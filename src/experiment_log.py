@@ -53,10 +53,19 @@ def init_db(db_path=None):
                 iou TEXT,
                 boundary_iou TEXT,
                 quantity_disagreement REAL,
-                allocation_disagreement REAL
+                allocation_disagreement REAL,
+                pixels_altered INTEGER
             )
             """
         )
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(experiment_logs)")
+        }
+        if "pixels_altered" not in columns:
+            conn.execute(
+                "ALTER TABLE experiment_logs ADD COLUMN pixels_altered INTEGER"
+            )
 
 
 def _json_default(value):

@@ -83,24 +83,33 @@ def add_random_pixel_noise(y_true, n_classes, noise_rate, class_ids=None):
     return noisy
 
 
-def boundary_dilation_erosion(y_true, class_ids, std, fallback_class=0):
+def boundary_dilation_erosion(y_true, class_ids, mean, fallback_class=0):
     """
     Randomly dilate or erode connected objects of selected classes.
 
-    For each object, a signed amount is sampled from N(0, std). Positive values
-    dilate the object boundary, negative values erode it. Eroded pixels are
-    filled with the dominant neighboring class.
+    For each object, a magnitude is sampled from N(mean, 0.1 * mean), clipped
+    at zero, and rounded to a whole number of pixels. An independent sign then
+    selects dilation or erosion with equal probability. Eroded pixels are
+    filled pixelwise from the nearest exterior label produced by preceding
+    erosions. All erosions are applied before any dilations.
     """
     y_true = np.asarray(y_true)
+    if y_true.ndim != 3:
+        raise ValueError("'y_true' must have shape (images, height, width).")
+    if not np.isfinite(mean) or mean < 0:
+        raise ValueError("'mean' must be a finite, non-negative number.")
     if isinstance(class_ids, (int, np.integer)):
         class_ids = [int(class_ids)]
     class_ids = [int(class_id) for class_id in class_ids]
 
     noisy = y_true.copy()
     structure = np.ones((3, 3), dtype=bool)
+    magnitude_std = 0.1 * mean
 
     for i, mask in enumerate(y_true):
         noisy_mask = noisy[i]
+        h, w = mask.shape
+        plans = []
 
         for class_id in class_ids:
             class_mask = mask == class_id
@@ -109,14 +118,21 @@ def boundary_dilation_erosion(y_true, class_ids, std, fallback_class=0):
 
             labeled, n_objects = ndimage.label(class_mask, structure=structure)
             object_slices = ndimage.find_objects(labeled)
-            amounts = np.rint(
-                np.random.normal(loc=0.0, scale=std, size=n_objects)
-            ).astype(np.int16)
-            h, w = mask.shape
+            magnitudes = np.maximum(
+                np.random.normal(
+                    loc=mean, scale=magnitude_std, size=n_objects
+                ),
+                0.0,
+            )
+            signs = 2 * np.random.binomial(1, 0.5, size=n_objects) - 1
+            amounts = (signs * np.rint(magnitudes)).astype(np.int32)
+            plans.append((class_id, labeled, object_slices, amounts))
 
-            for obj_id, obj_slice in enumerate(object_slices, start=1):
-                amount = amounts[obj_id - 1]
-                if obj_slice is None or amount == 0:
+        for class_id, labeled, object_slices, amounts in plans:
+            for obj_id, (obj_slice, amount) in enumerate(
+                zip(object_slices, amounts), start=1
+            ):
+                if obj_slice is None or amount >= 0:
                     continue
 
                 iterations = abs(int(amount))
@@ -131,16 +147,6 @@ def boundary_dilation_erosion(y_true, class_ids, std, fallback_class=0):
                 local_object = labeled[local_slice] == obj_id
                 local_noisy = noisy_mask[local_slice].copy()
 
-                if amount > 0:
-                    changed_region = ndimage.binary_dilation(
-                        local_object,
-                        structure=structure,
-                        iterations=iterations,
-                    )
-                    local_noisy[changed_region] = class_id
-                    noisy_mask[local_slice] = local_noisy
-                    continue
-
                 eroded = ndimage.binary_erosion(
                     local_object,
                     structure=structure,
@@ -151,19 +157,44 @@ def boundary_dilation_erosion(y_true, class_ids, std, fallback_class=0):
                 if not changed_region.any():
                     continue
 
-                neighbor_region = (
-                    ndimage.binary_dilation(changed_region, structure=structure)
-                    & ~local_object
-                )
-                neighbor_labels = local_noisy[neighbor_region]
-                valid_labels = neighbor_labels[neighbor_labels != class_id]
-
-                if valid_labels.size > 0:
-                    fill_label = int(np.bincount(valid_labels.astype(np.int64)).argmax())
+                if (~local_object).any():
+                    nearest = ndimage.distance_transform_edt(
+                        local_object,
+                        return_distances=False,
+                        return_indices=True,
+                    )
+                    local_noisy[changed_region] = local_noisy[
+                        nearest[0][changed_region],
+                        nearest[1][changed_region],
+                    ]
                 else:
-                    fill_label = fallback_class
+                    local_noisy[changed_region] = fallback_class
+                noisy_mask[local_slice] = local_noisy
 
-                local_noisy[changed_region] = fill_label
+        for class_id, labeled, object_slices, amounts in plans:
+            for obj_id, (obj_slice, amount) in enumerate(
+                zip(object_slices, amounts), start=1
+            ):
+                if obj_slice is None or amount <= 0:
+                    continue
+
+                iterations = int(amount)
+                y_slice, x_slice = obj_slice
+                pad = iterations + 1
+                y0 = max(y_slice.start - pad, 0)
+                y1 = min(y_slice.stop + pad, h)
+                x0 = max(x_slice.start - pad, 0)
+                x1 = min(x_slice.stop + pad, w)
+                local_slice = (slice(y0, y1), slice(x0, x1))
+
+                local_object = labeled[local_slice] == obj_id
+                changed_region = ndimage.binary_dilation(
+                    local_object,
+                    structure=structure,
+                    iterations=iterations,
+                )
+                local_noisy = noisy_mask[local_slice].copy()
+                local_noisy[changed_region] = class_id
                 noisy_mask[local_slice] = local_noisy
 
     return noisy
@@ -263,136 +294,161 @@ def add_semantic_swapping(y_true, y_pred, n_classes, swap_prob, class_ids=None):
     return noisy_set
 
 
-def shift_objects(y_true, class_ids, std, shift_prob=1.0):
-    """
-    Shift connected components using bbox-local masks.
-    """
+def _sample_shift_vectors(num_images, mean):
+    """Sample one integer (dy, dx) shift vector per image."""
+    if not np.isfinite(mean) or mean < 0:
+        raise ValueError("'mean' must be a finite, non-negative number.")
+
+    std = 0.1 * mean
+    distances = np.maximum(
+        np.random.normal(loc=mean, scale=std, size=num_images), 0.0
+    )
+    angles = np.random.uniform(0.0, 2.0 * np.pi, size=num_images)
+    return np.rint(
+        np.column_stack((np.sin(angles), np.cos(angles))) * distances[:, None]
+    ).astype(np.int32)
+
+
+def shift_objects(y_true, class_ids, mean):
+    """Shift selected connected objects using one sampled vector per image."""
     y_true = np.asarray(y_true)
+    if y_true.ndim != 3:
+        raise ValueError("'y_true' must have shape (images, height, width).")
     if isinstance(class_ids, (int, np.integer)):
         class_ids = [int(class_ids)]
     class_ids = [int(class_id) for class_id in class_ids]
 
-    direction_angle = np.random.uniform(0.0, 2.0 * np.pi)
-    direction = np.array([np.cos(direction_angle), np.sin(direction_angle)])
-
-    noisy_set = np.copy(y_true)
+    shift_vectors = _sample_shift_vectors(len(y_true), mean)
+    output = y_true.copy()
     structure = np.ones((3, 3), dtype=np.int32)
-    neigh_struct = np.ones((3, 3), dtype=bool)
+    neighbor_structure = np.ones((3, 3), dtype=bool)
 
-    for i, mask in enumerate(y_true):
-        noisy = noisy_set[i].copy()
-        orig_mask = mask
-        h, w = mask.shape
+    for image_index, (original, (dy, dx)) in enumerate(
+        zip(y_true, shift_vectors)
+    ):
+        if dx == 0 and dy == 0:
+            continue
+
+        shifted_image = output[image_index].copy()
+        height, width = original.shape
+        shifted_occupancy = np.zeros_like(original, dtype=bool)
 
         for class_id in class_ids:
-            class_mask = orig_mask == class_id
-            if not class_mask.any():
-                continue
+            labeled, _ = ndimage.label(original == class_id, structure=structure)
 
-            labeled, _ = ndimage.label(class_mask, structure=structure)
-            object_slices = ndimage.find_objects(labeled)
-
-            for obj_idx, obj_slice in enumerate(object_slices, start=1):
-                if obj_slice is None or np.random.rand() > shift_prob:
+            for object_id, object_slice in enumerate(
+                ndimage.find_objects(labeled), start=1
+            ):
+                if object_slice is None:
                     continue
 
-                shift_distance = abs(np.random.normal(loc=std / 2, scale=std))
-                shift_x, shift_y = direction * shift_distance
-                dx = int(round(shift_x))
-                dy = int(round(shift_y))
-                if dx == 0 and dy == 0:
-                    continue
-
-                y_slice, x_slice = obj_slice
+                y_slice, x_slice = object_slice
                 y0, y1 = y_slice.start, y_slice.stop
                 x0, x1 = x_slice.start, x_slice.stop
-
-                object_patch = labeled[y_slice, x_slice] == obj_idx
-                obj_rows, obj_cols = np.nonzero(object_patch)
-                if obj_rows.size == 0:
-                    continue
-
-                orig_rows = obj_rows + y0
-                orig_cols = obj_cols + x0
-                new_rows = orig_rows + dy
-                new_cols = orig_cols + dx
+                object_patch = labeled[object_slice] == object_id
+                object_rows, object_cols = np.nonzero(object_patch)
+                original_rows = object_rows + y0
+                original_cols = object_cols + x0
+                origin_labels = shifted_image[original_rows, original_cols].copy()
+                occupied_by_prior_shift = shifted_occupancy[
+                    original_rows, original_cols
+                ].copy()
+                new_rows = original_rows + int(dy)
+                new_cols = original_cols + int(dx)
                 in_bounds = (
                     (new_rows >= 0)
-                    & (new_rows < h)
+                    & (new_rows < height)
                     & (new_cols >= 0)
-                    & (new_cols < w)
+                    & (new_cols < width)
                 )
 
-                noisy[orig_rows, orig_cols] = 0
-                if in_bounds.any():
-                    noisy[new_rows[in_bounds], new_cols[in_bounds]] = class_id
+                shifted_image[original_rows, original_cols] = 0
+                shifted_image[new_rows[in_bounds], new_cols[in_bounds]] = class_id
+                shifted_occupancy[new_rows[in_bounds], new_cols[in_bounds]] = True
 
                 new_on_original = np.zeros_like(object_patch, dtype=bool)
-                if in_bounds.any():
-                    bounded_rows = new_rows[in_bounds]
-                    bounded_cols = new_cols[in_bounds]
-                    inside_original_bbox = (
-                        (bounded_rows >= y0)
-                        & (bounded_rows < y1)
-                        & (bounded_cols >= x0)
-                        & (bounded_cols < x1)
-                    )
-                    if inside_original_bbox.any():
-                        new_on_original[
-                            bounded_rows[inside_original_bbox] - y0,
-                            bounded_cols[inside_original_bbox] - x0,
-                        ] = True
-
+                inside_original_box = (
+                    in_bounds
+                    & (new_rows >= y0)
+                    & (new_rows < y1)
+                    & (new_cols >= x0)
+                    & (new_cols < x1)
+                )
+                new_on_original[
+                    new_rows[inside_original_box] - y0,
+                    new_cols[inside_original_box] - x0,
+                ] = True
                 vacated_patch = object_patch & ~new_on_original
                 if not vacated_patch.any():
                     continue
 
-                pad_y0 = max(y0 - 1, 0)
-                pad_y1 = min(y1 + 1, h)
-                pad_x0 = max(x0 - 1, 0)
-                pad_x1 = min(x1 + 1, w)
-                pad_slice = (slice(pad_y0, pad_y1), slice(pad_x0, pad_x1))
+                vacated_pixels = vacated_patch[object_rows, object_cols]
+                restore_prior_shift = vacated_pixels & occupied_by_prior_shift
+                shifted_image[
+                    original_rows[restore_prior_shift],
+                    original_cols[restore_prior_shift],
+                ] = origin_labels[restore_prior_shift]
 
-                local_original = labeled[pad_slice] == obj_idx
-                neighbor_mask = (
-                    ndimage.binary_dilation(local_original, structure=neigh_struct)
-                    & ~local_original
-                )
-
-                neighbor_labels = noisy[pad_slice][neighbor_mask]
-                valid_labels = neighbor_labels[neighbor_labels != class_id]
-                if valid_labels.size == 0:
+                needs_neighbor_fill = vacated_pixels & ~occupied_by_prior_shift
+                if not needs_neighbor_fill.any():
                     continue
 
-                dominant = int(np.bincount(valid_labels.astype(np.int64)).argmax())
-                vacated_pixels = vacated_patch[obj_rows, obj_cols]
-                noisy[obj_rows[vacated_pixels] + y0, obj_cols[vacated_pixels] + x0] = dominant
+                padded_slice = (
+                    slice(max(y0 - 1, 0), min(y1 + 1, height)),
+                    slice(max(x0 - 1, 0), min(x1 + 1, width)),
+                )
+                local_object = labeled[padded_slice] == object_id
+                neighbor_mask = (
+                    ndimage.binary_dilation(
+                        local_object, structure=neighbor_structure
+                    )
+                    & ~local_object
+                )
+                neighbor_labels = shifted_image[padded_slice][neighbor_mask]
+                valid_labels = neighbor_labels[neighbor_labels != class_id]
+                if valid_labels.size:
+                    fill_class = int(
+                        np.bincount(valid_labels.astype(np.int64)).argmax()
+                    )
+                    shifted_image[
+                        original_rows[needs_neighbor_fill],
+                        original_cols[needs_neighbor_fill],
+                    ] = fill_class
 
-        noisy_set[i] = noisy
+        output[image_index] = shifted_image
 
-    return noisy_set
+    return output
 
 
-def noisy_zoom(y_true, std, fill_class=0):
-    """
-    Zoom each label mask with a normally distributed scale.
-    """
+def noisy_zoom(y_true, mean):
+    """Zoom masks in or out by a normally distributed magnitude."""
     y_true = np.asarray(y_true)
+    if y_true.ndim != 3:
+        raise ValueError("'y_true' must have shape (images, height, width).")
+    if not np.isfinite(mean) or not 0.0 < mean < 1.0:
+        raise ValueError("'mean' must be finite and strictly between zero and one.")
 
     output = np.empty_like(y_true)
     h, w = y_true.shape[1], y_true.shape[2]
     center = (w / 2.0, h / 2.0)
-    scales = np.maximum(np.random.normal(loc=1.0, scale=std, size=len(y_true)), 0.4)
+    std = 0.1 * mean
+    magnitudes = np.random.normal(loc=mean, scale=std, size=len(y_true))
+    invalid = (magnitudes <= 0.0) | (magnitudes >= 1.0)
+    while invalid.any():
+        magnitudes[invalid] = np.random.normal(
+            loc=mean, scale=std, size=int(invalid.sum())
+        )
+        invalid = (magnitudes <= 0.0) | (magnitudes >= 1.0)
+    signs = 2 * np.random.binomial(1, 0.5, size=len(y_true)) - 1
+    scales = 1.0 + signs * magnitudes
 
     for i, (mask, scale) in enumerate(zip(y_true, scales)):
         matrix = cv2.getRotationMatrix2D(center, 0.0, scale)
 
         if scale >= 1.0:
             border_mode = cv2.BORDER_CONSTANT
-            border_value = fill_class
         else:   
             border_mode = cv2.BORDER_REFLECT_101
-            border_value = 0
 
         output[i] = cv2.warpAffine(
             mask,
@@ -400,19 +456,18 @@ def noisy_zoom(y_true, std, fill_class=0):
             (w, h),
             flags=cv2.INTER_NEAREST,
             borderMode=border_mode,
-            borderValue=border_value,
         )
 
     return output
 
 
-def shift_scene(y_true, std):
-    """
-    Shift the full label mask and mirror-fill newly exposed border pixels.
-    """
+def shift_scene(y_true, mean):
+    """Shift each full label mask in an independently sampled direction."""
     y_true = np.asarray(y_true)
+    if y_true.ndim != 3:
+        raise ValueError("'y_true' must have shape (images, height, width).")
 
-    shift_vectors = np.random.normal(loc=0.0, scale=std, size=(y_true.shape[0], 2)).astype(np.int32)
+    shift_vectors = _sample_shift_vectors(len(y_true), mean)
     output = np.empty_like(y_true)
 
     for i, mask in enumerate(y_true):

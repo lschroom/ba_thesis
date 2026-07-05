@@ -23,6 +23,3 @@ external/
 
 # metrics of experiment
 metrics.json
-
-# tests
-tests/

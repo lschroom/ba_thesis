@@ -1,0 +1,72 @@
+[project]
+root = ".."
+
+[dataset]
+data_root = "data/oem_sar"
+labels_dir = "test/labels"
+labels_pattern = "*.tif"
+predictions_dir = "results"
+predictions_pattern = "*.png"
+expected_images = 490
+num_classes = 9
+
+[outputs]
+noise_dir = "data/oem_sar/noise"
+actual_db = "experiments/eval_results.db"
+perfect_db = "experiments/eval_results_perfect_pred.db"
+manifest = "experiments/experiment_manifest.json"
+backup_dir = "experiments/backups"
+
+[run]
+global_seed = 42
+repetitions = 5
+resume = true
+adopt_legacy = false
+
+[inference]
+enabled = false
+checkpoint = "external/oem_sar/Semantic_Segmentation/pretrained/SAR_Mix_5_u-efficientnet-b4.pth"
+results_dir = "results"
+
+[[noise]]
+method = "random_pixels"
+severity_parameter = "noise_rate"
+values = [0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2, 0.225, 0.25]
+params = { n_classes = 9 }
+
+[[noise]]
+method = "swap_classes"
+severity_parameter = "swap_prob"
+values = [0.02, 0.04, 0.06, 0.08, 0.1, 0.12, 0.14, 0.16, 0.18, 0.2]
+params = { n_classes = 9 }
+
+[[noise]]
+method = "zoom"
+severity_parameter = "mean"
+values = [0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2, 0.225, 0.25]
+params = {}
+
+[[noise]]
+method = "shift_scene"
+severity_parameter = "mean"
+values = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40]
+params = {}
+
+[[noise]]
+method = "shift_objects"
+severity_parameter = "mean"
+values = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40]
+params = { class_ids = [5, 8] }
+
+[[noise]]
+method = "boundary_morphology"
+severity_parameter = "mean"
+values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+params = { class_ids = [1, 2, 3, 4, 5, 6, 7, 8], fallback_class = 0 }
+
+[[noise]]
+method = "add_omission"
+severity_parameter = "omission_prob"
+values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+# This is the 90th-percentile connected-component size for the canonical test set.
+params = { class_ids = [1, 2, 3, 4, 5, 6, 7, 8], fallback_class = 0, small_object_threshold = 2258.0 }

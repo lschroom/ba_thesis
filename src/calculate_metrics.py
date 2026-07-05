@@ -115,7 +115,12 @@ def boundary_mask(mask, width=1):
 
 def boundary_iou(y_true, y_pred, num_classes, boundary_width=1):
     """
-    Compute dataset-level boundary IoU.
+    Compute per-class boundary IoU from dataset-pooled boundary counts.
+
+    Boundary intersections and unions are calculated within each image so
+    boundaries never cross image edges.  Counts are then summed over images
+    before division, weighting the result by boundary-union size.
+
     Accepts either:
     - y_true, y_pred: (H, W) single image
     - y_true, y_pred: (N, H, W) dataset
@@ -137,35 +142,35 @@ def boundary_iou(y_true, y_pred, num_classes, boundary_width=1):
         y_true = y_true.reshape(n_images, side, side)
         y_pred = y_pred.reshape(n_images, side, side)
 
-    if y_true.ndim == 3:
-        image_scores = []
-        for true_mask, pred_mask in zip(y_true, y_pred):
-            image_scores.append(
-                boundary_iou(
-                    true_mask,
-                    pred_mask,
-                    num_classes=num_classes,
-                    boundary_width=boundary_width
-                )
+    if y_true.ndim == 2:
+        y_true = y_true[np.newaxis, ...]
+        y_pred = y_pred[np.newaxis, ...]
+
+    total_intersections = np.zeros(num_classes - 1, dtype=np.int64)
+    total_unions = np.zeros(num_classes - 1, dtype=np.int64)
+
+    for true_mask, pred_mask in zip(y_true, y_pred):
+        pred_mask = np.where(true_mask == 0, 0, pred_mask)
+        for class_index, class_id in enumerate(range(1, num_classes)):
+            true_boundary = boundary_mask(
+                true_mask == class_id, width=boundary_width
             )
-        return np.nanmean(image_scores, axis=0) if image_scores else np.full(num_classes - 1, np.nan)
+            pred_boundary = boundary_mask(
+                pred_mask == class_id, width=boundary_width
+            )
+            total_intersections[class_index] += np.logical_and(
+                true_boundary, pred_boundary
+            ).sum()
+            total_unions[class_index] += np.logical_or(
+                true_boundary, pred_boundary
+            ).sum()
 
-    ious = []
-    y_pred = np.where(y_true == 0, 0, y_pred)
-
-    for i in range(1, num_classes):
-        true_boundary = boundary_mask(y_true == i, width=boundary_width)
-        pred_boundary = boundary_mask(y_pred == i, width=boundary_width)
-
-        union = np.logical_or(true_boundary, pred_boundary).sum()
-        if union == 0:
-            ious.append(np.nan)
-            continue
-
-        intersection = np.logical_and(true_boundary, pred_boundary).sum()
-        ious.append(intersection / union)
-
-    return np.asarray(ious, dtype=float)
+    return np.divide(
+        total_intersections,
+        total_unions,
+        out=np.full(num_classes - 1, np.nan, dtype=float),
+        where=total_unions != 0,
+    )
 
 
 def disagreement_metrics(y_true, y_pred, num_classes):
@@ -347,7 +352,7 @@ def creation_tstamp_from_noise_dir(noise_dir):
     return match.group(1)
 
 
-def evaluate_datasets(data_root, db_path=None, predictions="results", num_classes=9):
+def evaluate_datasets(data_root, db_path=None, predictions="results", num_classes=9, pred_file_ending="*.png"):
     data_root = pathlib.Path(data_root)
     db_path = pathlib.Path(db_path) if db_path is not None else DEFAULT_DB_PATH
     dataset_metrics = {}
@@ -355,7 +360,9 @@ def evaluate_datasets(data_root, db_path=None, predictions="results", num_classe
     all_metrics = set(METRIC_COLUMNS)
 
     prediction_dir = data_root / predictions
-    y_pred = np.array([load_labels(path) for path in sorted(prediction_dir.glob("*.png"), key=lambda p: p.name)]).flatten()
+    # y_pred = np.array([load_labels(path) for path in sorted(prediction_dir.glob("*.png"), key=lambda p: p.name)]).flatten()
+    y_pred = np.array([load_labels(path) for path in sorted(prediction_dir.glob(pred_file_ending), key=lambda p: p.name)]).flatten()
+
 
     noise_root = data_root / "noise"
     direct_subdirs = sorted([path for path in noise_root.iterdir() if path.is_dir()])
